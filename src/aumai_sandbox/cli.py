@@ -8,7 +8,12 @@ from pathlib import Path
 
 import click
 
-from aumai_sandbox.core import CapabilityParseError, CapabilityParser, SandboxError, SandboxManager
+from aumai_sandbox.core import (
+    CapabilityParseError,
+    CapabilityParser,
+    SandboxError,
+    SandboxManager,
+)
 from aumai_sandbox.models import CapabilityDeclaration
 
 
@@ -54,9 +59,12 @@ def run_command(config_path: str, timeout: float, command: tuple[str, ...]) -> N
     manager = SandboxManager()
     sandbox_id = manager.create_sandbox(capability)
 
+    tier = capability.sandbox_tier.value
     click.echo(
-        click.style(f"[sandbox] created  id={sandbox_id}  tier={capability.sandbox_tier.value}",
-                    fg="cyan")
+        click.style(
+            f"[sandbox] created  id={sandbox_id}  tier={tier}",
+            fg="cyan",
+        )
     )
     click.echo(click.style(f"[sandbox] running  $ {' '.join(command)}", fg="cyan"))
 
@@ -143,11 +151,13 @@ def validate_command(config_path: str, output_format: str) -> None:
         click.echo(f"  sandbox_tier       : {capability.sandbox_tier.value}")
         click.echo(f"  filesystem_mode    : {capability.filesystem_config.mode.value}")
         click.echo(f"  max_memory_mb      : {capability.resource_limits.max_memory_mb}")
-        click.echo(f"  max_cpu_seconds    : {capability.resource_limits.max_cpu_seconds}")
+        cpu_secs = capability.resource_limits.max_cpu_seconds
+        click.echo(f"  max_cpu_seconds    : {cpu_secs}")
         click.echo(f"  max_cost_usd       : {capability.resource_limits.max_cost_usd}")
         click.echo(f"  max_tokens         : {capability.resource_limits.max_tokens}")
         click.echo(f"  egress_rules       : {len(capability.network_egress_rules)}")
-        click.echo(f"  permissions        : {', '.join(capability.permissions) or '(none)'}")
+        perms = ", ".join(capability.permissions) or "(none)"
+        click.echo(f"  permissions        : {perms}")
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +181,9 @@ def inspect_command(ctx: click.Context, sandbox_id: str) -> None:
     have already exited by the time this command runs.
     """
     # The manager is ephemeral per-process; expose a contextual one if passed.
-    manager: SandboxManager = ctx.obj if isinstance(ctx.obj, SandboxManager) else SandboxManager()
+    manager: SandboxManager = (
+        ctx.obj if isinstance(ctx.obj, SandboxManager) else SandboxManager()
+    )
 
     try:
         sandbox_status = manager.status(sandbox_id)
@@ -193,7 +205,7 @@ def inspect_command(ctx: click.Context, sandbox_id: str) -> None:
 
 
 def _load_capability(config_path: str) -> CapabilityDeclaration:
-    """Load a CapabilityDeclaration from a YAML file, printing errors and exiting on failure."""
+    """Load a CapabilityDeclaration from a YAML file, exiting on failure."""
     try:
         return CapabilityParser.from_file(Path(config_path))
     except CapabilityParseError as exc:

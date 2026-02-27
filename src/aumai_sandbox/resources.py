@@ -100,9 +100,10 @@ class ResourceMonitor:
     def snapshot(self) -> dict[str, Any]:
         """Return a point-in-time snapshot of all tracked metrics."""
         with self._lock:
-            elapsed = (
-                time.monotonic() - self._start_time if self._start_time is not None else 0.0
-            )
+            if self._start_time is not None:
+                elapsed = time.monotonic() - self._start_time
+            else:
+                elapsed = 0.0
             return {
                 "cpu_seconds": round(self._cpu_seconds or elapsed, 3),
                 "peak_memory_mb": round(self._peak_memory_mb, 2),
@@ -143,8 +144,8 @@ class ResourceMonitor:
                 memory_mb = mem.rss / (1024 * 1024)
                 if memory_mb > self._peak_memory_mb:
                     self._peak_memory_mb = memory_mb
-        except Exception:
-            # Process ended or access denied — ignore.
+        except Exception:  # noqa: BLE001,S110
+            # Process ended or access denied — ignore silently.
             pass
 
 

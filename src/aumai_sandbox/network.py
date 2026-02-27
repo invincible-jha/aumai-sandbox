@@ -1,4 +1,8 @@
-"""Network egress filtering for aumai-sandbox."""
+"""Egress filtering policy utilities.
+
+NOTE: These are advisory validation checks. Runtime enforcement requires
+network namespace isolation, iptables rules, or eBPF filters.
+"""
 
 from __future__ import annotations
 

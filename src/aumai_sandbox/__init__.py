@@ -19,7 +19,12 @@ Public API::
     )
 """
 
-from aumai_sandbox.core import CapabilityParseError, CapabilityParser, SandboxError, SandboxManager
+from aumai_sandbox.core import (
+    CapabilityParseError,
+    CapabilityParser,
+    SandboxError,
+    SandboxManager,
+)
 from aumai_sandbox.filesystem import FilesystemPolicy, validate_path_access
 from aumai_sandbox.models import (
     CapabilityDeclaration,

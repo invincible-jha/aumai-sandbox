@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import fnmatch
+import logging
+import os
+import platform
 import subprocess
 import threading
 import time
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -14,15 +19,31 @@ from pydantic import ValidationError
 
 from aumai_sandbox.models import (
     CapabilityDeclaration,
-    FilesystemConfig,
-    FilesystemMode,
-    NetworkEgressRule,
     ResourceLimits,
     SandboxResult,
     SandboxStatus,
     SandboxTier,
 )
-from aumai_sandbox.resources import ResourceMonitor, check_limits
+from aumai_sandbox.resources import ResourceMonitor
+
+_logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Sensitive environment variable patterns (fnmatch-style)
+# ---------------------------------------------------------------------------
+
+_SENSITIVE_ENV_PATTERNS: tuple[str, ...] = (
+    "*_KEY",
+    "*_SECRET",
+    "*_TOKEN",
+    "*_PASSWORD",
+    "*_CREDENTIAL",
+    "AWS_*",
+    "AZURE_*",
+    "GCP_*",
+    "OPENAI_*",
+    "ANTHROPIC_*",
+)
 
 
 class SandboxError(Exception):
@@ -34,12 +55,39 @@ class CapabilityParseError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Environment filtering
+# ---------------------------------------------------------------------------
+
+
+def _filter_environment(env: dict[str, str]) -> dict[str, str]:
+    """Return *env* with all sensitive variables removed.
+
+    Variables are filtered when their name matches any pattern in
+    :data:`_SENSITIVE_ENV_PATTERNS` using case-sensitive :func:`fnmatch.fnmatch`.
+
+    Args:
+        env: Source environment mapping (typically ``dict(os.environ)``).
+
+    Returns:
+        A new dict that contains no keys matching a sensitive pattern.
+    """
+    filtered: dict[str, str] = {}
+    for key, value in env.items():
+        is_sensitive = any(
+            fnmatch.fnmatch(key, pattern) for pattern in _SENSITIVE_ENV_PATTERNS
+        )
+        if not is_sensitive:
+            filtered[key] = value
+    return filtered
+
+
+# ---------------------------------------------------------------------------
 # CapabilityParser
 # ---------------------------------------------------------------------------
 
 
 class CapabilityParser:
-    """Parse YAML capability files into :class:`~aumai_sandbox.models.CapabilityDeclaration`.
+    """Parse YAML capability files into CapabilityDeclaration objects.
 
     Expected YAML shape::
 
@@ -162,9 +210,26 @@ class SandboxManager:
             resource_limits=ResourceLimits(max_cpu_seconds=5.0)
         )
         sandbox_id = mgr.create_sandbox(capability)
-        result = mgr.execute(sandbox_id, ["python", "-c", "print('hello')"], timeout=10.0)
+        result = mgr.execute(
+            sandbox_id, ["python", "-c", "print('hello')"], timeout=10.0
+        )
         mgr.destroy(sandbox_id)
     """
+
+    ISOLATION_WARNING: str = (
+        "No kernel-level isolation is enforced in this implementation. "
+        "The sandbox provides policy orchestration only. "
+        "For production use, deploy with gVisor or Firecracker."
+    )
+
+    # Shell metacharacters that must not appear in command[0] (the executable).
+    _SHELL_METACHARACTERS: frozenset[str] = frozenset(";|&$`\n")
+
+    # Known safe executables — command[0] values outside this set trigger a log
+    # warning but are NOT blocked (enforcement is advisory).
+    _KNOWN_EXECUTABLES: frozenset[str] = frozenset(
+        {"python", "python3", "node", "bash", "sh"}
+    )
 
     def __init__(self) -> None:
         self._sandboxes: dict[str, _SandboxState] = {}
@@ -219,10 +284,20 @@ class SandboxManager:
             exit code, duration, and resource usage.
 
         Raises:
-            SandboxError: If *sandbox_id* is unknown or the sandbox is not
-                          in a runnable state.
+            SandboxError: If *sandbox_id* is unknown, the sandbox is not
+                          in a runnable state, or *command* fails validation.
         """
+        # S-C2: Validate command before any subprocess work.
+        self._validate_command(command)
+
         state = self._get_state(sandbox_id)
+
+        # S-C1: Warn when no real kernel-level isolation is available.
+        tier = state.capability.sandbox_tier
+        system = platform.system()
+        if system != "Linux" or tier == SandboxTier.seccomp:
+            warnings.warn(self.ISOLATION_WARNING, stacklevel=2)
+            _logger.warning(self.ISOLATION_WARNING)
 
         with state.lock:
             if state.status not in (SandboxStatus.created, SandboxStatus.stopped):
@@ -239,6 +314,9 @@ class SandboxManager:
             proc_env = self._build_environment(state.capability)
             cmd_with_prefix = self._build_command_prefix(state.capability) + command
 
+            # S-H1: Log filesystem policy advisory check (non-blocking).
+            self._log_filesystem_policy_advisory(command, state.capability)
+
             proc = subprocess.Popen(  # noqa: S603
                 cmd_with_prefix,
                 stdout=subprocess.PIPE,
@@ -252,16 +330,19 @@ class SandboxManager:
             monitor.start(pid=proc.pid)
 
             # Poll: enforce resource limits during execution.
-            effective_timeout = min(timeout, state.capability.resource_limits.max_cpu_seconds * 2)
+            # S-M3: Use timeout directly; CPU enforcement is handled by ResourceMonitor.
             stdout_bytes, stderr_bytes = self._wait_with_limit_checks(
                 proc=proc,
                 monitor=monitor,
                 limits=state.capability.resource_limits,
-                effective_timeout=effective_timeout,
+                effective_timeout=timeout,
             )
 
+        except SandboxError:
+            # Re-raise SandboxError (e.g. from _validate_command) without wrapping.
+            raise
         except Exception as exc:
-            monitor.stop()
+            # S-M2: monitor.stop() is only in finally — removed duplicate here.
             elapsed_ms = (time.monotonic() - start) * 1000
             with state.lock:
                 state.status = SandboxStatus.failed
@@ -308,8 +389,8 @@ class SandboxManager:
                 try:
                     state.process.kill()
                     state.process.wait(timeout=5.0)
-                except Exception:
-                    pass
+                except Exception:  # noqa: BLE001,S110
+                    pass  # Process already dead or permission denied — safe to ignore.
                 state.process = None
             state.status = SandboxStatus.stopped
 
@@ -343,17 +424,50 @@ class SandboxManager:
             raise SandboxError(f"unknown sandbox id: {sandbox_id}")
         return state
 
+    def _validate_command(self, command: list[str]) -> None:
+        """Validate *command* before subprocess execution.
+
+        Args:
+            command: The argv list to validate.
+
+        Raises:
+            SandboxError: If the command is empty or command[0] contains shell
+                          metacharacters that indicate a shell-injection attempt.
+        """
+        if not command:
+            raise SandboxError("command must not be empty")
+
+        executable = command[0]
+        found_meta = [ch for ch in self._SHELL_METACHARACTERS if ch in executable]
+        if found_meta:
+            raise SandboxError(
+                f"command executable contains disallowed shell metacharacters "
+                f"{found_meta!r}: {executable!r}"
+            )
+
+        if executable not in self._KNOWN_EXECUTABLES:
+            _logger.warning(
+                "command executable %r is not in the set of known-safe executables %r; "
+                "proceeding but verify the binary is trusted",
+                executable,
+                sorted(self._KNOWN_EXECUTABLES),
+            )
+
     def _build_environment(self, capability: CapabilityDeclaration) -> dict[str, str]:
         """Build a restricted environment dict for the subprocess.
 
-        Only allow environment variables that are explicitly safe.  The
-        ``read_env`` permission in capability.permissions unlocks the full
-        process environment (useful for development agents).
+        Only allow environment variables that are explicitly safe.  When the
+        ``read_env`` permission is granted the full process environment is passed
+        through, but all variables matching :data:`_SENSITIVE_ENV_PATTERNS` are
+        always filtered out.  If ``capability.env_allowlist`` is set, only those
+        specific variable names survive (after sensitive-pattern filtering).
         """
-        import os
-
         if "read_env" in capability.permissions:
-            return dict(os.environ)
+            filtered = _filter_environment(dict(os.environ))
+            if capability.env_allowlist is not None:
+                allowlist_set = set(capability.env_allowlist)
+                filtered = {k: v for k, v in filtered.items() if k in allowlist_set}
+            return filtered
 
         # Minimal environment: PATH and PYTHONPATH only.
         safe_keys = {"PATH", "PYTHONPATH", "SYSTEMROOT", "TEMP", "TMP", "HOME"}
@@ -364,9 +478,10 @@ class SandboxManager:
 
         On Linux with gVisor installed this would return ``["runsc", "run"]``.
         On Windows we return an empty prefix (subprocess isolation only).
-        """
-        import platform
 
+        NOTE: Seccomp and Firecracker tiers do not yet apply a real kernel
+        filter via this implementation — a TODO for a future Linux backend.
+        """
         tier = capability.sandbox_tier
         system = platform.system()
 
@@ -375,15 +490,51 @@ class SandboxManager:
             return []
 
         prefix_map: dict[SandboxTier, list[str]] = {
-            SandboxTier.seccomp: [],  # enforced by the kernel implicitly
+            # TODO: Apply an actual seccomp-bpf filter profile here; currently
+            # no filter is loaded, so this tier provides no kernel restriction.
+            SandboxTier.seccomp: [],
             SandboxTier.gvisor: ["runsc", "run"],  # requires gVisor installation
-            SandboxTier.firecracker: [],  # requires Firecracker — orchestration TBD
+            # TODO: Wire up Firecracker VM launch; currently falls back to
+            # subprocess with no VM isolation.
+            SandboxTier.firecracker: [],
         }
         return prefix_map.get(tier, [])
 
+    def _log_filesystem_policy_advisory(
+        self,
+        command: list[str],
+        capability: CapabilityDeclaration,
+    ) -> None:
+        """Log an advisory warning if the command touches paths outside policy.
+
+        This is a pre-flight advisory check only; it does NOT block execution.
+        Runtime enforcement requires OS-level isolation (chroot, mount namespaces).
+        """
+        from aumai_sandbox.filesystem import FilesystemPolicy
+
+        policy = FilesystemPolicy(capability.filesystem_config)
+        # Inspect argv entries that look like file paths (contain a path separator
+        # or start with / or .) as a heuristic — not exhaustive.
+        for arg in command[1:]:
+            if "/" in arg or arg.startswith(".") or (len(arg) > 2 and arg[1] == ":"):
+                if not policy.can_read(arg):
+                    reason = policy.deny_reason(arg, "read")
+                    _logger.warning(
+                        "[advisory] filesystem policy would deny read access to %r: %s",
+                        arg,
+                        reason,
+                    )
+                if not policy.can_write(arg):
+                    reason = policy.deny_reason(arg, "write")
+                    _logger.warning(
+                        "[advisory] filesystem policy would deny write access to %r: %s",
+                        arg,
+                        reason,
+                    )
+
     def _wait_with_limit_checks(
         self,
-        proc: "subprocess.Popen[bytes]",
+        proc: subprocess.Popen[bytes],
         monitor: ResourceMonitor,
         limits: ResourceLimits,
         effective_timeout: float,
@@ -442,4 +593,6 @@ __all__ = [
     "CapabilityParser",
     "SandboxError",
     "SandboxManager",
+    "_filter_environment",
+    "_SENSITIVE_ENV_PATTERNS",
 ]

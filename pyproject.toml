@@ -52,6 +52,14 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "UP", "ANN", "S", "B"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",   # assert is the standard pytest assertion mechanism
+    "S108",   # /tmp paths are intentional in tests
+    "ANN",    # type annotations on test helpers are optional
+    "SLF001", # accessing private members is necessary for whitebox tests
+]
+
 [tool.mypy]
 strict = true
 python_version = "3.11"

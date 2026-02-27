@@ -1,4 +1,9 @@
-"""Filesystem isolation policy enforcement for aumai-sandbox."""
+"""Policy validation utilities for path access control.
+
+NOTE: These are pre-flight advisory checks. Runtime enforcement requires
+OS-level isolation (chroot, mount namespaces) provided by the container
+backend.
+"""
 
 from __future__ import annotations
 
@@ -44,11 +49,12 @@ class FilesystemPolicy:
             return None
         fs_mode = self._config.mode
         if fs_mode == FilesystemMode.none:
-            return f"filesystem access is disabled (mode=none); denied {mode} on '{path}'"
+            return (
+                f"filesystem access is disabled (mode=none); denied {mode} on '{path}'"
+            )
         if mode == "write" and fs_mode == FilesystemMode.read_only:
             return f"sandbox is read-only; denied write on '{path}'"
         if mode == "write":
-            normalized = _normalize(path)
             allowed = [_normalize(p) for p in self._config.writable_paths]
             return (
                 f"path '{path}' is not under any writable_paths "
@@ -100,14 +106,10 @@ def validate_path_access(path: str, mode: str, config: FilesystemConfig) -> bool
     normalized_target = _normalize(path)
     for allowed_prefix in config.writable_paths:
         normalized_prefix = _normalize(allowed_prefix)
-        # pathlib.is_relative_to covers exact match and proper subdirectories.
         try:
-            normalized_target.is_relative_to(normalized_prefix)
-            if normalized_target == normalized_prefix or normalized_target.is_relative_to(
-                normalized_prefix
-            ):
+            if normalized_target.is_relative_to(normalized_prefix):
                 return True
-        except AttributeError:
+        except (TypeError, AttributeError):
             # Python < 3.9 fallback (is_relative_to added in 3.9)
             try:
                 normalized_target.relative_to(normalized_prefix)
@@ -123,11 +125,13 @@ def validate_path_access(path: str, mode: str, config: FilesystemConfig) -> bool
 # ---------------------------------------------------------------------------
 
 
-def _normalize(path: str) -> pathlib.PurePosixPath:
+def _normalize(path: str) -> pathlib.PurePath:
     """Normalize *path* for comparison (resolve ``..`` etc.)."""
     # Use os.path.normpath for cross-platform normalization then convert.
-    normalized = os.path.normpath(path).replace("\\", "/")
-    return pathlib.PurePosixPath(normalized)
+    # PurePath is used instead of PurePosixPath so Windows paths are handled
+    # correctly on all platforms.
+    normalized = os.path.normpath(path)
+    return pathlib.PurePath(normalized)
 
 
 __all__ = ["FilesystemPolicy", "validate_path_access"]
